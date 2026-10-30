@@ -1,0 +1,128 @@
+# Fine-tune SVTRv2-B (CTC) cho nhận dạng biển số xe
+# Pretrained: ./pretrained/svtrv2_b/best.pth (SVTRv2-B Union14M-L-Filter; chỉ encoder được nạp, head CTC khởi tạo lại theo từ điển biển số)
+# Dữ liệu: LMDB tạo bằng tools/prepare_plate_dataset.py -> ./plate_dataset/{train,val}
+Global:
+  device: gpu
+  epoch_num: 50
+  log_smooth_window: 20
+  print_batch_step: 10
+  output_dir: ./output/rec/plate/svtrv2_b_plate
+  save_epoch_step: [40, 5]
+  eval_epoch_step: [0, 1]
+  eval_batch_step: [0, 500]
+  cal_metric_during_train: True
+  pretrained_model: ./pretrained/svtrv2_b/best.pth # để trống nếu train từ đầu
+  checkpoints:
+  use_tensorboard: false
+  infer_img:
+  # for data or label process
+  character_dict_path: &character_dict_path ./tools/utils/plate_dict.txt # 0-9 A-Z - .
+  max_text_length: &max_text_length 16
+  use_space_char: &use_space_char False
+  save_res_path: ./output/rec/plate/predicts_svtrv2_b_plate.txt
+  use_amp: True
+
+Optimizer:
+  name: AdamW
+  lr: 0.0002 # fine-tune, bs128 x 1 GPU; tăng/giảm tuyến tính theo tổng batch size
+  weight_decay: 0.05
+  filter_bias_and_bn: True
+
+LRScheduler:
+  name: OneCycleLR
+  warmup_epoch: 2
+  cycle_momentum: False
+
+Architecture:
+  model_type: rec
+  algorithm: SVTRv2
+  Transform:
+  Encoder:
+    name: SVTRv2LNConvTwo33
+    use_pos_embed: False
+    dims: [128, 256, 384]
+    depths: [6, 6, 6]
+    num_heads: [4, 8, 12]
+    mixer: [['Conv','Conv','Conv','Conv','Conv','Conv'],['Conv','Conv','FGlobal','Global','Global','Global'],['Global','Global','Global','Global','Global','Global']]
+    local_k: [[5, 5], [5, 5], [-1, -1]]
+    sub_k: [[1, 1], [2, 1], [-1, -1]]
+    last_stage: false
+    feat2d: True
+  Decoder:
+    name: RCTCDecoder
+
+Loss:
+  name: CTCLoss
+  zero_infinity: True
+
+PostProcess:
+  name: CTCLabelDecode
+  character_dict_path: *character_dict_path
+  use_space_char: *use_space_char
+
+Metric:
+  name: RecMetric
+  main_indicator: acc
+  is_filter: False # giữ nguyên '-' và '.' khi tính accuracy
+  is_lower: False  # biển số chỉ có chữ in hoa
+
+Train:
+  dataset:
+    name: RatioDataSetTVResize
+    ds_width: True
+    padding: False
+    data_dir_list: ['./plate_dataset/train']
+    transforms:
+      - DecodeImagePIL: # load image
+          img_mode: RGB
+      - PARSeqAugPIL:
+      - CTCLabelEncode: # Class handling label
+          character_dict_path: *character_dict_path
+          use_space_char: *use_space_char
+          max_text_length: *max_text_length
+      - KeepKeys:
+          keep_keys: ['image', 'label', 'length'] # dataloader will return list in this order
+  sampler:
+    name: RatioSampler
+    scales: [[144, 48]] # w, h (biển 1 dòng ~ tỉ lệ 3-5, biển 2 dòng ~ 1-1.5)
+    # divide_factor: to ensure the width and height dimensions can be devided by downsampling multiple
+    first_bs: &bs 128
+    fix_bs: false
+    divided_factor: [4, 16] # w, h
+    is_training: True
+  loader:
+    shuffle: True
+    batch_size_per_card: *bs
+    drop_last: True
+    max_ratio: &max_ratio 6
+    num_workers: 4
+
+Eval:
+  dataset:
+    name: RatioDataSetTVResize
+    ds_width: True
+    padding: False
+    data_dir_list: ['./plate_dataset/val']
+    transforms:
+      - DecodeImagePIL: # load image
+          img_mode: RGB
+      - CTCLabelEncode: # Class handling label
+          character_dict_path: *character_dict_path
+          use_space_char: *use_space_char
+          max_text_length: *max_text_length
+      - KeepKeys:
+          keep_keys: ['image', 'label', 'length'] # dataloader will return list in this order
+  sampler:
+    name: RatioSampler
+    scales: [[144, 48]] # w, h
+    # divide_factor: to ensure the width and height dimensions can be devided by downsampling multiple
+    first_bs: *bs
+    fix_bs: false
+    divided_factor: [4, 16] # w, h
+    is_training: False
+  loader:
+    shuffle: False
+    drop_last: False
+    batch_size_per_card: *bs
+    max_ratio: *max_ratio
+    num_workers: 4
